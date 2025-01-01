@@ -3,10 +3,11 @@ import torch
 import pyro
 import pyro.distributions as dist
 from pyro.infer import MCMC, NUTS
-import pandas as pd
+# import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel
 import os
@@ -17,14 +18,21 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 np.random.seed(42)
 torch.manual_seed(42)
 
-# Helper Functions
 def load_data(sample_ratio=0.01):
-    """Load a subset of the Yelp Polarity dataset."""
+    """
+    Load a subset of the Yelp Polarity dataset.
+    Change `sample_ratio` to process more data once testing is complete.
+    """
     print("Loading dataset...")
-    return load_dataset("yelp_polarity", split=f"train[:{int(sample_ratio * 100)}%]")
+    split = f"train[:{int(sample_ratio * 100)}%]"
+    if int(sample_ratio * 100) == 0:
+        raise ValueError("sample_ratio too small, resulting in no data!")
+    return load_dataset("yelp_polarity", split=split)
 
 def extract_features(text, tokenizer, model):
-    """Extract features from text using a pre-trained BERT model."""
+    """
+    Extract features from text using a pre-trained BERT model.
+    """
     tokens = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
     with torch.no_grad():
         outputs = model(**tokens)
@@ -32,7 +40,9 @@ def extract_features(text, tokenizer, model):
     return embeddings.squeeze(0).numpy()
 
 def preprocess_data(dataset, tokenizer, model, pca_components=10):
-    """Preprocess dataset to extract features, reduce dimensionality, and prepare labels."""
+    """
+    Preprocess dataset to extract features, reduce dimensionality, and prepare labels.
+    """
     Z, X, Y = [], [], []
     start_time = time.time()
     print("Extracting features...")
@@ -48,7 +58,6 @@ def preprocess_data(dataset, tokenizer, model, pca_components=10):
     end_time = time.time()
     print(f"Feature extraction took {end_time - start_time:.2f} seconds")
     
-    # Reduce dimensionality of BERT embeddings
     print("Performing PCA on BERT embeddings...")
     pca = PCA(n_components=pca_components)
     Z_reduced = pca.fit_transform(Z)
@@ -56,7 +65,10 @@ def preprocess_data(dataset, tokenizer, model, pca_components=10):
     return np.array(Z_reduced), np.array(X), np.array(Y)
 
 def causal_model(Z, X, Y=None):
-    """Define a Bayesian causal model."""
+    """
+    alpha = pyro.sample("alpha", dist.Gamma(2.0, 2.0))
+    mean_Y = alpha + beta * X + torch.sum(
+    """
     n_samples, n_covariates = Z.shape
     alpha = pyro.sample("alpha", dist.Gamma(2.0, 2.0))
     sigma = pyro.sample("sigma", dist.HalfNormal(1.0))
@@ -69,33 +81,47 @@ def causal_model(Z, X, Y=None):
         Y = pyro.sample("Y", dist.Normal(mean_Y, sigma), obs=Y)
     return Y
 
-def train_test_split(X, Y, Z, train_ratio=0.8):
-    """Perform a train-test split on the dataset."""
-    dataset_size = len(X)
-    train_size = int(train_ratio * dataset_size)
-    indices = torch.randperm(dataset_size)
-    train_indices, test_indices = indices[:train_size], indices[train_size:]
-    return (X[train_indices], X[test_indices],
-            Y[train_indices], Y[test_indices],
-            Z[train_indices], Z[test_indices])
-
 def diagnostics(mcmc):
-    """Perform diagnostics on MCMC results."""
+    """
+    Perform diagnostics on MCMC results, including R-hat and trace plots.
+    """
     print("Performing diagnostics...")
     mcmc.summary()
     samples = mcmc.get_samples()
     
-    for param, value in samples.items():
-        print(f"R-hat for {param}: {torch.mean(torch.abs(value - value.mean())):.2f}")
-    
+    # Generate trace plots
     for param, value in samples.items():
         plt.figure(figsize=(10, 4))
         plt.plot(value.numpy(), label=f"Trace plot for {param}")
         plt.legend()
         plt.show()
+    
+    return samples
+
+def sensitivity_analysis(Z_test, X_test, samples, Y_test):
+    """
+    Perform sensitivity analysis to test robustness of causal estimates.
+    """
+    weights_mean = samples['weights'].mean(axis=0)
+    beta_mean = samples['beta'].mean()
+
+    # Predictions with slight perturbations in X
+    perturbed_X = X_test + torch.normal(0, 0.1, size=X_test.size())
+    predictions = beta_mean * perturbed_X + torch.sum(Z_test * weights_mean, axis=1)
+
+    residuals = Y_test.numpy() - predictions.numpy()
+
+    print("Sensitivity Analysis - Perturbed Results:")
+    sns.histplot(residuals, kde=True, color='purple')
+    plt.title('Residual Distribution (Perturbed Test Set)')
+    plt.xlabel('Residual (Actual - Predicted)')
+    plt.ylabel('Density')
+    plt.show()
 
 def visualize_results(samples, Y_test, predictions):
-    """Visualize the results of the model's predictions."""
+    """
+    Visualize posterior distributions and residuals for the model's predictions.
+    """
     plt.figure(figsize=(12, 6))
     sns.histplot(samples['alpha'].numpy(), kde=True, label='alpha', color='blue')
     sns.histplot(samples['sigma'].numpy(), kde=True, label='sigma', color='green')
@@ -124,8 +150,10 @@ def visualize_results(samples, Y_test, predictions):
     plt.show()
 
 def main():
-    """Main pipeline for loading data, training, and saving results."""
-    dataset = load_data(sample_ratio=0.01)
+    """
+    Main pipeline for loading data, training, and validating the model.
+    """
+    dataset = load_data(sample_ratio=0.4) 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model = AutoModel.from_pretrained("bert-base-uncased")
     model.eval()
@@ -133,21 +161,21 @@ def main():
     Z, X, Y = preprocess_data(dataset, tokenizer, model, pca_components=10)
     Z, X, Y = map(lambda arr: torch.tensor(arr, dtype=torch.float32), (Z, X, Y))
 
-    X_train, X_test, Y_train, Y_test, Z_train, Z_test = train_test_split(X, Y, Z)
+    X_train, X_test, Y_train, Y_test, Z_train, Z_test = train_test_split(X, Y, Z, train_size=0.8)
 
     print("Running MCMC...")
     nuts_kernel = NUTS(causal_model)
     mcmc = MCMC(nuts_kernel, num_samples=1000, warmup_steps=200)
     mcmc.run(Z_train, X_train, Y_train)
     
-    diagnostics(mcmc)
-    
-    samples = mcmc.get_samples()
+    samples = diagnostics(mcmc)
+
     weights_mean = samples['weights'].mean(axis=0)
     beta_mean = samples['beta'].mean()
-    
     predictions = beta_mean * X_test + torch.sum(Z_test * weights_mean, axis=1)
+
     visualize_results(samples, Y_test, predictions)
+    sensitivity_analysis(Z_test, X_test, samples, Y_test)
 
 if __name__ == "__main__":
     main()
